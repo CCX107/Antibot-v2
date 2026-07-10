@@ -13,9 +13,11 @@ Antibot 是一个基于用户访问行为特征的人机风险识别与分层分
 
 ## 2. 核心能力
 
-- 近 21 天神策 pageview 明细同步与本地 parquet 缓存
+- 近 45 天神策 pageview 明细同步与本地 parquet 缓存
 - IForest 模型异常识别结果缓存
 - XGBoost mixed gray 模型风险概率缓存
+- 按日增量补数、历史单日回补与模型特征增量重算
+- “寻求报道”访问用户独立分析，支持风险分类、缓存复用和 CSV/Excel 导出
 - A-F 风险分层：
   - A：双模型一致高危
   - B：XGB 高置信新增
@@ -37,6 +39,8 @@ Antibot 是一个基于用户访问行为特征的人机风险识别与分层分
 - `sensor_machine_2026_test.parquet`：原始 pageview 明细缓存，由数据同步逻辑生成
 - `features_all_iforest_v2_exclude_eu.parquet`：IForest 模型预测后的用户日特征缓存
 - `features_all_xgb_mixed_v2_exclude_eu_mixed_gray.parquet`：XGBoost 模型预测后的用户日特征缓存
+- `sensor_machine_2026_test_parts/`：命令行同步过程中使用的 pageview 日分片目录，合并成功后默认清理
+- `seek_report_joined.parquet`：“寻求报道”目标访问用户与本地模型结果的按日关联缓存
 - `antibot_pipeline_v2_exclude_eu.pkl`：IForest pipeline 模型文件，本仓库不包含
 - `xgb_model_mixed_v2_exclude_eu_mixed_gray.pkl`：XGBoost 模型文件，本仓库不包含
 
@@ -46,11 +50,17 @@ Antibot 是一个基于用户访问行为特征的人机风险识别与分层分
 
 ```text
 Impala / 神策 pageview 明细
-→ 本地原始 parquet 缓存
+→ 按日分片落盘并合并为本地原始 parquet 缓存
 → IForest / XGBoost 模型打分
 → 用户日级特征缓存 parquet
 → DuckDB 创建 feature_view
 → Streamlit 看板展示
+
+寻求报道 pageview
+→ 按日聚合目标用户
+→ 左连本地模型特征
+→ seek_report_joined.parquet
+→ 独立筛选、统计与导出
 ```
 
 DuckDB 用于直接读取 parquet 并执行分析型 SQL，避免每次页面交互都用 pandas 重算大表，从而提升看板响应速度。
@@ -76,6 +86,49 @@ cp antibot.env.example antibot.env
 # 编辑 antibot.env，填写本地数据目录、模型文件名和数据库连接信息
 python -m streamlit run antibot.py
 ```
+
+也可以用命令行脚本做定时同步，默认同步最近 45 天并重算模型缓存：
+
+```bash
+python antibot_daily_sync.py
+# 如需同时更新“寻求报道”结果表缓存：
+python antibot_daily_sync.py --update-seek-report
+# 如需忽略缓存判断并强制全量刷新：
+python antibot_daily_sync.py --update-seek-report --force-refresh
+# 指定回补区间（默认结束日是昨天）：
+python antibot_daily_sync.py --start-date 2026-07-01 --end-date 2026-07-09
+# 长步骤默认每 30 秒输出一次等待心跳；如需调整：
+python antibot_daily_sync.py --update-seek-report --progress-interval 60
+# 大范围补数默认按 1 天一片执行，避免 Impala 大结果连接中断；如需调大片：
+python antibot_daily_sync.py --update-seek-report --sql-chunk-days 3
+# 调整单分片 SQL 的失败重试次数：
+python antibot_daily_sync.py --sql-retries 2
+# 如需关闭终端进度和等待心跳：
+python antibot_daily_sync.py --no-progress
+# 如需关闭 macOS 桌面通知：
+python antibot_daily_sync.py --no-notify
+```
+
+脚本默认会先判断本地 parquet 是否已覆盖当前日期窗口且不早于模型文件；已是最新时会直接复用缓存，缺少个别日期时只补缺失日期，避免重复跑整段 SQL 和模型重算。
+
+为了降低大表补数失败成本，命令行同步会先将原始 pageview 按日期写入本地日分片目录（默认 `sensor_machine_2026_test_parts/`），每个 SQL 分片成功后立即落盘；所有缺失日期补完后，再统一合并生成 `sensor_machine_2026_test.parquet` 供模型和看板复用。合并成功后默认清理本次窗口内的日分片；如需保留排查，可加 `--keep-raw-parts`。
+
+同步脚本使用锁文件防止两个任务同时写缓存。如确认没有任务运行但遗留了锁，可用 `--force-lock`；也可用 `--lock-file` 指定其他锁路径。
+
+### macOS 每日定时同步
+
+```bash
+# 安装 launchd 任务
+zsh scripts/install_daily_sync_launchd.sh
+
+# 手动运行与 launchd 相同的包装脚本
+zsh scripts/run_antibot_daily_sync.sh
+
+# 卸载 launchd 任务
+zsh scripts/uninstall_daily_sync_launchd.sh
+```
+
+`launchd` 任务的日志默认写入 `~/.antibot_daily_sync_runtime/logs/`；在项目目录手动运行包装脚本时，默认写入项目的 `logs/`。运行结果会尝试发送 macOS 桌面通知。如 Python 不在默认路径，安装前设置 `ANTIBOT_PYTHON=/path/to/python`。
 
 如果当前仓库使用的是 `requirement.txt` 文件名，请按本地实际文件名安装依赖：
 
@@ -107,10 +160,12 @@ pip install -r requirement.txt
 ## 8. 缓存更新逻辑
 
 - 点击侧边栏“获取昨日最新数据并重算大盘”后，会从数据仓库拉取增量数据
-- 新数据会与本地原始 parquet 合并，并保留最近 21 天窗口
-- 原始数据更新后，会重算可用模型的特征缓存
+- 新数据会与本地原始 parquet 合并，并保留最近 45 天窗口
+- 侧边栏支持临时回补某个历史单日，补齐后同步更新对应日期的模型结果
+- 原始数据更新后，优先只重算新增或回补日期的模型特征；缓存结构不兼容或模型变更时才全量重建
 - 如果模型文件或原始数据比特征缓存更新，页面加载时会自动重建对应特征缓存
 - 如果缓存有效，则直接复用 parquet 特征结果
+- “寻求报道”页签使用独立日期范围；已覆盖的日期直接复用 `seek_report_joined.parquet`，缺失或过期时再查询并替换对应日期
 
 ## 9. 风险分层说明
 
