@@ -1,5 +1,11 @@
 streamlit
+numpy
 pandas
 scikit-learn
 joblib
+xgboost
+duckdb
+plotly
+pyarrow
 impyla
+openpyxl

@@ -36,13 +36,14 @@ Antibot 是一个基于用户访问行为特征的人机风险识别与分层分
 
 本地主要使用以下文件：
 
-- `sensor_machine_2026_test.parquet`：原始 pageview 明细缓存，由数据同步逻辑生成
-- `features_all_iforest_v2_exclude_eu.parquet`：IForest 模型预测后的用户日特征缓存
-- `features_all_xgb_mixed_v2_exclude_eu_mixed_gray.parquet`：XGBoost 模型预测后的用户日特征缓存
+- `sensor_machine_2026_test.parquet`：原始 pageview 明细缓存，包含 `$screen_width`、`$screen_height`，由数据同步逻辑生成
+- `features_all_iforest_v3_resolution_zscore.parquet`：包含分辨率日占比正向 Z-score 的 IForest 用户日特征缓存
+- `features_all_xgb_mixed_v3_resolution_zscore.parquet`：对应 13 特征 XGBoost 用户日预测缓存
 - `sensor_machine_2026_test_parts/`：命令行同步过程中使用的 pageview 日分片目录，合并成功后默认清理
 - `seek_report_joined.parquet`：“寻求报道”目标访问用户与本地模型结果的按日关联缓存
-- `antibot_pipeline_v2_exclude_eu.pkl`：IForest pipeline 模型文件，本仓库不包含
-- `xgb_model_mixed_v2_exclude_eu_mixed_gray.pkl`：XGBoost 模型文件，本仓库不包含
+- `antibot_pipeline_v3_resolution_zscore.pkl`：12+1 IForest pipeline 模型文件，本仓库不包含
+- `xgb_model_mixed_v3_resolution_zscore.pkl`：对应的 mixed-gray XGBoost 模型文件，本仓库不包含
+- `redteam_results_resolution_v3.json`：四类红队场景的可重复压测结果，看板优先读取该文件
 
 这些数据、模型、缓存文件都不会提交到 GitHub，应通过 `.gitignore` 排除。README 中只描述文件用途，不提供真实文件内容。
 
@@ -51,6 +52,7 @@ Antibot 是一个基于用户访问行为特征的人机风险识别与分层分
 ```text
 Impala / 神策 pageview 明细
 → 按日分片落盘并合并为本地原始 parquet 缓存
+→ 使用训练期正常用户基准计算主分辨率日占比正向 Z-score
 → IForest / XGBoost 模型打分
 → 用户日级特征缓存 parquet
 → DuckDB 创建 feature_view
@@ -188,6 +190,10 @@ pip install -r requirement.txt
 - 高度拟真人：更接近真实用户行为的灰产样本
 
 这些压测结果用于解释模型召回、绕过率和正常池压力，不包含真实用户隐私数据。
+
+分辨率模型的压测可通过 `python scripts/run_redteam_resolution.py` 重跑，结果写入
+`redteam_results_resolution_v3.json`，看板会优先读取该文件。对应的版本化 IForest
+模型固化及 mixed-gray XGBoost 训练可通过 `python scripts/train_resolution_xgb.py` 重现。
 
 ## 11. 安全说明
 

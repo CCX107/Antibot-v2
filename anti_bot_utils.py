@@ -2,6 +2,83 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
+
+RESOLUTION_Z_FEATURE = "resolution_share_positive_zscore"
+OTHER_RESOLUTION = "__OTHER_RESOLUTION__"
+MIN_SCREEN_PX = 100
+MAX_SCREEN_PX = 10_000
+
+
+def _normalize_screen_events(df):
+    """Normalize raw Sensors Analytics screen fields without dropping events."""
+    required = ["$screen_width", "$screen_height"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"分辨率特征缺少原始字段: {missing}")
+
+    out = df.copy()
+    width = pd.to_numeric(out["$screen_width"], errors="coerce")
+    height = pd.to_numeric(out["$screen_height"], errors="coerce")
+    valid = (
+        width.notna()
+        & height.notna()
+        & width.between(MIN_SCREEN_PX, MAX_SCREEN_PX)
+        & height.between(MIN_SCREEN_PX, MAX_SCREEN_PX)
+    )
+    width = width.where(valid).round().astype("Int64")
+    height = height.where(valid).round().astype("Int64")
+    short_side = pd.concat([width, height], axis=1).min(axis=1).astype("Int64")
+    long_side = pd.concat([width, height], axis=1).max(axis=1).astype("Int64")
+    out["resolution_canonical"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out.loc[valid, "resolution_canonical"] = (
+        short_side.loc[valid].astype("string")
+        + "x"
+        + long_side.loc[valid].astype("string")
+    )
+    return out
+
+
+def _stable_mode(series):
+    values = series.dropna()
+    if values.empty:
+        return pd.NA
+    return values.value_counts().index[0]
+
+
+def _resolution_main_user_days(events):
+    required = ["date", "distinct_id", "$screen_width", "$screen_height"]
+    missing = [col for col in required if col not in events.columns]
+    if missing:
+        raise ValueError(f"分辨率特征输入缺少字段: {missing}")
+
+    normalized = _normalize_screen_events(events)
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="raise").dt.normalize()
+    return (
+        normalized.groupby(["date", "distinct_id"], observed=True)["resolution_canonical"]
+        .agg(_stable_mode)
+        .rename("main_resolution_canonical")
+        .reset_index()
+    )
+
+
+class FeatureColumnSelector(BaseEstimator, TransformerMixin):
+    """Stable, pickle-safe selector used by versioned production pipelines."""
+
+    def __init__(self, columns):
+        self.columns = columns
+
+    def fit(self, X, y=None):
+        missing = [col for col in self.columns if col not in X.columns]
+        if missing:
+            raise ValueError(f"模型特征缺失: {missing}")
+        return self
+
+    def transform(self, X):
+        missing = [col for col in self.columns if col not in X.columns]
+        if missing:
+            raise ValueError(f"模型特征缺失: {missing}")
+        return X.loc[:, self.columns]
+
 class UnifiedUserBehaviorCleaner(BaseEstimator, TransformerMixin):
     def __init__(self, feature_cols):#创建初始参数，后续都要使用，所以在__init__中使用
         self.feature_cols = feature_cols#定义我们最终要输出的特征列顺序，确保每次 transform 都输出一致的列
@@ -177,3 +254,200 @@ class UnifiedUserBehaviorCleaner(BaseEstimator, TransformerMixin):
             
         # 第三步：现在 output_list 是 13 个名字了，安检通过！
         return features.reindex(columns=output_list, fill_value=0.0)
+
+
+class UnifiedUserBehaviorCleanerWithResolutionShareZ(UnifiedUserBehaviorCleaner):
+    """Original behavior features plus a positive daily resolution-share Z-score.
+
+    The reference distribution is learned only during ``fit``.  At prediction
+    time each user's main canonical resolution is mapped to that day's share,
+    and only an upward deviation from the fitted normal baseline is retained.
+    Invalid or missing resolutions are neutral (zero) and never remove a user.
+    """
+
+    def __init__(
+        self,
+        feature_cols,
+        min_baseline_days=7,
+        min_baseline_user_days=100,
+        z_clip=10.0,
+    ):
+        super().__init__(feature_cols=feature_cols)
+        self.min_baseline_days = min_baseline_days
+        self.min_baseline_user_days = min_baseline_user_days
+        self.z_clip = z_clip
+
+    def _bucket_user_days(self, X):
+        user_days = _resolution_main_user_days(X)
+        valid = user_days["main_resolution_canonical"].notna()
+        user_days["resolution_bucket"] = pd.Series(
+            pd.NA, index=user_days.index, dtype="string"
+        )
+        is_common = user_days["main_resolution_canonical"].isin(self.common_resolutions_)
+        user_days.loc[valid & is_common, "resolution_bucket"] = user_days.loc[
+            valid & is_common, "main_resolution_canonical"
+        ].astype("string")
+        user_days.loc[valid & ~is_common, "resolution_bucket"] = OTHER_RESOLUTION
+        return user_days
+
+    def _daily_share_grid(self, user_days, dates):
+        dates = list(pd.to_datetime(pd.Index(dates), errors="raise").normalize().unique())
+        categories = list(self.common_resolutions_) + [OTHER_RESOLUTION]
+        valid = user_days.dropna(subset=["resolution_bucket"])
+        counts = valid.groupby(
+            ["date", "resolution_bucket"], observed=True
+        ).size().rename("resolution_user_days")
+        grid = pd.MultiIndex.from_product(
+            [dates, categories], names=["date", "resolution_bucket"]
+        )
+        daily = counts.reindex(grid, fill_value=0).reset_index()
+        totals = valid.groupby("date", observed=True).size().rename("valid_user_days")
+        daily = daily.merge(totals, on="date", how="left")
+        daily["valid_user_days"] = daily["valid_user_days"].fillna(0).astype(int)
+        daily["daily_share"] = np.where(
+            daily["valid_user_days"].gt(0),
+            daily["resolution_user_days"] / daily["valid_user_days"],
+            0.0,
+        )
+        return daily
+
+    def _summarize_daily_shares(self, daily):
+        rows = []
+        for resolution, part in daily.groupby("resolution_bucket", observed=True):
+            values = part["daily_share"].astype(float)
+            center = float(values.median())
+            mean = float(values.mean())
+            std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            mad = float((values - center).abs().median())
+            robust_std = 1.4826 * mad
+            if np.isfinite(robust_std) and robust_std > self.share_scale_floor_:
+                scale = robust_std
+                scale_source = "MAD"
+            elif np.isfinite(std) and std > self.share_scale_floor_:
+                scale = std
+                scale_source = "STD_FALLBACK"
+            else:
+                scale = self.share_scale_floor_
+                scale_source = "FLOOR"
+            rows.append({
+                "resolution": str(resolution),
+                "daily_share_mean": mean,
+                "daily_share_median": center,
+                "daily_share_std": std,
+                "daily_share_mad": mad,
+                "daily_share_scale": float(scale),
+                "scale_source": scale_source,
+                "baseline_days": int(part["date"].nunique()),
+                "total_user_days": int(part["resolution_user_days"].sum()),
+                "days_present": int(
+                    part.loc[part["resolution_user_days"].gt(0), "date"].nunique()
+                ),
+            })
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _score_daily_share(current, baseline, z_clip):
+        scored = current.merge(
+            baseline[["resolution", "daily_share_median", "daily_share_scale"]],
+            left_on="resolution_bucket",
+            right_on="resolution",
+            how="left",
+            validate="many_to_one",
+        )
+        scored[RESOLUTION_Z_FEATURE] = (
+            (scored["daily_share"] - scored["daily_share_median"])
+            / scored["daily_share_scale"]
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(
+            lower=0.0, upper=z_clip
+        )
+        return scored[["date", "resolution_bucket", "daily_share", RESOLUTION_Z_FEATURE]]
+
+    def fit(self, X, y=None):
+        super().fit(X, y)
+        raw_user_days = _resolution_main_user_days(X)
+        valid = raw_user_days.dropna(subset=["main_resolution_canonical"])
+        if valid.empty:
+            raise ValueError("12+1 训练正常样本没有有效主分辨率。")
+
+        resolution_stats = valid.groupby(
+            "main_resolution_canonical", observed=True
+        ).agg(
+            total_user_days=("distinct_id", "size"),
+            days_present=("date", "nunique"),
+        ).reset_index()
+        common = resolution_stats.loc[
+            resolution_stats["total_user_days"].ge(self.min_baseline_user_days)
+            & resolution_stats["days_present"].ge(self.min_baseline_days),
+            "main_resolution_canonical",
+        ]
+        self.common_resolutions_ = tuple(sorted(common.astype(str).tolist()))
+        self.training_dates_ = tuple(
+            sorted(pd.to_datetime(valid["date"]).dt.normalize().unique())
+        )
+        if len(self.training_dates_) < 3:
+            raise ValueError("训练期有效日期少于3天，无法构造稳定的分辨率日占比基准。")
+
+        bucketed = self._bucket_user_days(X)
+        daily_valid_totals = bucketed.dropna(subset=["resolution_bucket"]).groupby(
+            "date", observed=True
+        ).size()
+        typical_daily_users = float(daily_valid_totals.median())
+        self.share_scale_floor_ = max(0.5 / max(typical_daily_users, 1.0), 1e-6)
+        self.training_daily_share_ = self._daily_share_grid(bucketed, self.training_dates_)
+        self.resolution_daily_share_baseline_ = self._summarize_daily_shares(
+            self.training_daily_share_
+        )
+        self.resolution_vocabulary_stats_ = resolution_stats
+        return self
+
+    def _resolution_z_feature(self, X, leave_one_day_out):
+        user_days = self._bucket_user_days(X)
+        if user_days.empty:
+            empty_index = pd.MultiIndex.from_arrays(
+                [[], []], names=["date", "distinct_id"]
+            )
+            return pd.DataFrame(columns=[RESOLUTION_Z_FEATURE], index=empty_index)
+
+        current_dates = sorted(pd.to_datetime(user_days["date"]).dt.normalize().unique())
+        current_daily = self._daily_share_grid(user_days, current_dates)
+        if leave_one_day_out:
+            score_parts = []
+            for day in current_dates:
+                reference = self.training_daily_share_.loc[
+                    self.training_daily_share_["date"].ne(day)
+                ]
+                loo_baseline = self._summarize_daily_shares(reference)
+                score_parts.append(self._score_daily_share(
+                    current_daily.loc[current_daily["date"].eq(day)],
+                    loo_baseline,
+                    self.z_clip,
+                ))
+            daily_scores = pd.concat(score_parts, ignore_index=True)
+        else:
+            daily_scores = self._score_daily_share(
+                current_daily, self.resolution_daily_share_baseline_, self.z_clip
+            )
+
+        mapped = user_days.merge(
+            daily_scores[["date", "resolution_bucket", RESOLUTION_Z_FEATURE]],
+            on=["date", "resolution_bucket"],
+            how="left",
+            validate="many_to_one",
+        )
+        mapped[RESOLUTION_Z_FEATURE] = mapped[RESOLUTION_Z_FEATURE].fillna(0.0)
+        return mapped.set_index(["date", "distinct_id"])[[RESOLUTION_Z_FEATURE]]
+
+    def fit_transform(self, X, y=None, **fit_params):
+        self.fit(X, y)
+        base = UnifiedUserBehaviorCleaner.transform(self, X)
+        z_feature = self._resolution_z_feature(X, leave_one_day_out=True)
+        result = base.join(z_feature, how="left")
+        result[RESOLUTION_Z_FEATURE] = result[RESOLUTION_Z_FEATURE].fillna(0.0)
+        return result.reindex(columns=list(self.feature_cols) + [RESOLUTION_Z_FEATURE])
+
+    def transform(self, X):
+        base = UnifiedUserBehaviorCleaner.transform(self, X)
+        z_feature = self._resolution_z_feature(X, leave_one_day_out=False)
+        result = base.join(z_feature, how="left")
+        result[RESOLUTION_Z_FEATURE] = result[RESOLUTION_Z_FEATURE].fillna(0.0)
+        return result.reindex(columns=list(self.feature_cols) + [RESOLUTION_Z_FEATURE])
